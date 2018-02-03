@@ -62,6 +62,17 @@ def CacheRetrieveFunc(target, source, env):
                 pass
         st = fs.stat(cachefile)
         fs.chmod(t.get_internal_path(), stat.S_IMODE(st[stat.ST_MODE]) | stat.S_IWRITE)
+
+    # See if we have a signature file associated with the entry
+    cachecsig = cachefile + ".csig"
+    try:
+        with open(cachecsig, 'r') as cachecsigfile:
+            cached_csig = cachecsigfile.read()
+            cd.CacheDebug('CacheRetrieve(%s):  cached signature hit %s\n', t, cached_csig)
+            # WHERE DO I PUT THIS INFO SO IT GETS REUSED?
+    except:
+        pass
+
     return 0
 
 def CacheRetrieveString(target, source, env):
@@ -119,6 +130,14 @@ def CachePushFunc(target, source, env):
         else:
             fs.copy2(t.get_internal_path(), tempfile)
         fs.rename(tempfile, cachefile)
+
+        with open(tempfile + ".csig", 'w') as tempsig:
+            csig = t.get_csig()
+            tempsig.write(csig)
+        csigfile = cachefile + ".csig"
+        fs.rename(tempfile + ".csig", csigfile)
+        cd.CacheDebug('CachePush(%s):  pushing signature %s\n', t, csig)
+
         st = fs.stat(t.get_internal_path())
         fs.chmod(cachefile, stat.S_IMODE(st[stat.ST_MODE]) | stat.S_IWRITE)
     except EnvironmentError:
