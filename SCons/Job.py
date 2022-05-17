@@ -342,7 +342,7 @@ else:
                 worker.join(1.0)
             self.workers = []
 
-    class Parallel:
+    class LegacyParallel:
         """This class is used to execute tasks in parallel, and is somewhat
         less efficient than Serial, but is appropriate for parallel builds.
 
@@ -431,6 +431,240 @@ else:
 
             self.tp.cleanup()
             self.taskmaster.cleanup()
+
+
+    class NewParallel:
+
+        class Worker(threading.Thread):
+            def __init__(self, owner):
+                super().__init__()
+                self.daemon = True
+                self.owner = owner
+                self.start()
+
+            def run(self):
+                self.owner._work()
+
+        def __init__(self, taskmaster, num, stack_size):
+            self.taskmaster = taskmaster
+            self.interrupted = InterruptState()
+            self.num_workers = num
+            self.stack_size = stack_size
+            self.workers = []
+
+            # The `tm_lock` is what ensures that we only have one thread
+            # interacting with the taskmaster at a time. It also protects
+            # access to our state that gets updated concurrently. All condition
+            # variables are associated with this lock.
+            self.tm_lock = threading.Lock()
+
+            # The `searching` state and the `can_search_cv` are used
+            # to manage a leader / follower pattern for access to the
+            # taskmaster.
+            self.searching = False
+            self.can_search_cv = threading.Condition(self.tm_lock)
+
+            # The following state and idlers_cv helps us detect when
+            # threads must go idle, or when all idle threads must be
+            # awoken, or when we are all done and threads should
+            # terminate.
+            self.jobs = 0
+            self.completed = False
+            self.idle_epoch = 0
+            self.idlers = 0
+            self.idlers_cv = threading.Condition(self.tm_lock)
+
+            # The queue of tasks that have completed execution. The
+            # next thread to obtain the tm_lock will retire all of
+            # them.
+            self.results_queue_lock = threading.Lock()
+            self.results_queue = []
+
+        def start(self):
+            self._start_workers()
+            for worker in self.workers:
+                worker.join()
+            self.workers = []
+            self.taskmaster.cleanup()
+
+        def _start_workers(self):
+            prev_size = self._adjust_stack_size()
+            for _ in range(self.num_workers):
+                self.workers.append(NewParallel.Worker(self))
+            self._restore_stack_size(prev_size)
+
+        def _adjust_stack_size(self):
+            try:
+                prev_size = threading.stack_size(self.stack_size*1024)
+                return prev_size
+            except AttributeError as e:
+                # Only print a warning if the stack size has been
+                # explicitly set.
+                if explicit_stack_size is not None:
+                    msg = "Setting stack size is unsupported by this version of Python:\n    " + \
+                        e.args[0]
+                    SCons.Warnings.warn(SCons.Warnings.StackSizeWarning, msg)
+            except ValueError as e:
+                msg = "Setting stack size failed:\n    " + str(e)
+                SCons.Warnings.warn(SCons.Warnings.StackSizeWarning, msg)
+
+            return None
+
+        def _restore_stack_size(self, prev_size):
+            if prev_size is not None:
+                threading.stack_size(prev_size)
+
+        def _work(self):
+            while True:
+
+                # Obtain the `tm_lock` mutex that gives us exclusive
+                # access to the taskmaster.
+                with self.can_search_cv:
+
+                    # Assuming we haven't been marked completed, wait
+                    # until there is no other thread searching.
+                    while not self.completed and self.searching:
+                        self.can_search_cv.wait()
+
+                    # If someone set the completed flag, bail.
+                    if self.completed:
+                        break
+
+                    self.searching = True
+
+                    # Bulk acquire the tasks in the results queue
+                    # under the result queue lock, then process them
+                    # all. We need to process the tasks in the results
+                    # queue before looking for new work because we
+                    # might be unable to find new work if we don't.
+                    results_queue = []
+                    with self.results_queue_lock:
+                        results_queue, self.results_queue = self.results_queue, results_queue
+
+                    for (rtask, rresult) in results_queue:
+                        if rresult:
+                            rtask.executed()
+                        else:
+                            if self.interrupted():
+                                try:
+                                    raise SCons.Errors.BuildError(
+                                        rtask.targets[0], errstr=interrupt_msg)
+                                except:
+                                    rtask.exception_set()
+
+                            # Let the failed() callback function arrange
+                            # for the build to stop if that's appropriate.
+                            rtask.failed()
+
+                        rtask.postprocess()
+                        self.jobs -= 1
+
+                    # If we had results to process, and there are idle
+                    # threads, awaken them all. We need to awaken them
+                    # all because processing even one result might
+                    # unblock an arbitrary amount of new work.
+                    if results_queue and self.idlers:
+                        self.idle_epoch += 1
+                        self.idlers_cv.notify_all()
+
+                    # We are done with any task objects that
+                    # were in the results queue.
+                    results_queue.clear()
+
+                    # Now, turn the crank on the taskmaster until we
+                    # either run out of tasks, or find a task that
+                    # needs execution. If we run out of tasks, go idle
+                    # until results arrive if jobs are pending, or
+                    # mark the walk as complete if not.
+                    while self.searching:
+                        task = self.taskmaster.next_task()
+
+                        if task:
+                            # We found a task. Walk it through the
+                            # task lifecycle. If it does not need
+                            # execution, just complete the task and
+                            # look for the next one. Otherwise,
+                            # indicate that we are no longer searching
+                            # so we can drop out of this loop, execute
+                            # the task outside the lock, and allow
+                            # another thread in to search.
+                            try:
+                                task.prepare()
+                            except:
+                                task.exception_set()
+                                task.failed()
+                                task.postprocess()
+                            else:
+                                if not task.needs_execute():
+                                    task.executed()
+                                    task.postprocess()
+                                else:
+                                    self.jobs += 1
+                                    self.searching = False
+                                    self.can_search_cv.notify()
+
+                        else:
+                            # We failed to find a task, so this thread
+                            # cannot continue turning the taskmaster
+                            # crank. Note that we are no longer
+                            # searching so that we drop out of this
+                            # loop without `task` set.
+                            self.searching = False
+
+                            if self.jobs:
+                                # No task was found, but there are
+                                # outstanding jobs executing that
+                                # might unblock new tasks when they
+                                # complete. Note that we are becoming
+                                # idle, then wait here without holding
+                                # the lock until the idle epoch has
+                                # been advanced, meaning that new
+                                # results have arrived.
+                                idle_epoch = self.idle_epoch
+                                self.idlers += 1
+                                while self.idle_epoch == idle_epoch:
+                                    self.idlers_cv.wait()
+                                self.idlers -= 1
+                            else:
+                                # We didn't find a task and there are
+                                # no jobs outstanding, so there is
+                                # nothing that will ever return
+                                # results which might unblock new
+                                # tasks. We can conclude that the walk
+                                # is complete. If we are the first to
+                                # notice, set the completed flag and
+                                # awaken anyone sleeping on the
+                                # condvar.
+                                if not self.completed:
+                                    self.completed = True
+                                    self.can_search_cv.notify_all()
+
+                # We no longer hold `tm_lock` here. If we have a task,
+                # we can now execute it. If there are threads waiting
+                # to search, one of them can begin turning the
+                # taskmaster crank in parallel.
+                if task:
+                    ok = True
+                    try:
+                        if self.interrupted():
+                            raise SCons.Errors.BuildError(
+                                task.targets[0], errstr=interrupt_msg)
+                        task.execute()
+                    except:
+                        ok = False
+                        task.exception_set()
+
+                    # Grab the results lock and enqueue the executed task
+                    # and state. The next thread into the searching loop
+                    # will complete the postprocessing work under the
+                    # taskmaster lock.
+                    with self.results_queue_lock:
+                        self.results_queue.append((task, ok))
+
+                    # We have no further interest in `task`.
+                    task = None
+
+    Parallel = NewParallel
 
 # Local Variables:
 # tab-width:4
