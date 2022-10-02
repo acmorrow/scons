@@ -447,9 +447,9 @@ else:
 
         def __init__(self, taskmaster, num, stack_size):
             self.taskmaster = taskmaster
-            self.interrupted = InterruptState()
             self.num_workers = num
             self.stack_size = stack_size
+            self.interrupted = InterruptState()
             self.workers = []
 
             # The `tm_lock` is what ensures that we only have one thread
