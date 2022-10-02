@@ -530,13 +530,17 @@ else:
                     if self.completed:
                         break
 
+                    # Set the searching flag to indicate that a thread
+                    # is currently in the critical section for
+                    # taskmaster work.
                     self.searching = True
 
                     # Bulk acquire the tasks in the results queue
                     # under the result queue lock, then process them
-                    # all. We need to process the tasks in the results
-                    # queue before looking for new work because we
-                    # might be unable to find new work if we don't.
+                    # all outside the lock. We need to process the
+                    # tasks in the results queue before looking for
+                    # new work because we might be unable to find new
+                    # work if we don't.
                     results_queue = []
                     with self.results_queue_lock:
                         results_queue, self.results_queue = self.results_queue, results_queue
@@ -641,7 +645,7 @@ else:
 
                 # We no longer hold `tm_lock` here. If we have a task,
                 # we can now execute it. If there are threads waiting
-                # to search, one of them can begin turning the
+                # to search, one of them can now begin turning the
                 # taskmaster crank in parallel.
                 if task:
                     ok = True
