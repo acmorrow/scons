@@ -31,6 +31,7 @@ import SCons.compat
 
 import os
 import signal
+import threading
 
 import SCons.Errors
 import SCons.Warnings
@@ -464,15 +465,17 @@ else:
             self.searching = False
             self.can_search_cv = threading.Condition(self.tm_lock)
 
-            # The following state and idlers_cv helps us detect when
-            # threads must go idle, or when all idle threads must be
-            # awoken, or when we are all done and threads should
-            # terminate.
+            # The following state helps us manage the state machine as
+            # we decide whether there is more work to do or whether we
+            # need to stall on job completions.
             self.jobs = 0
             self.completed = False
-            self.idle_epoch = 0
-            self.idlers = 0
-            self.idlers_cv = threading.Condition(self.tm_lock)
+            self.stalled = False
+
+            # self.idle_epoch = 0
+            # self.idlers = 0
+            # self.idlers_cv = threading.Condition(self.tm_lock)
+            
 
             # The queue of tasks that have completed execution. The
             # next thread to obtain the tm_lock will retire all of
@@ -521,9 +524,18 @@ else:
                 # access to the taskmaster.
                 with self.can_search_cv:
 
+                    if self.stalled:
+                        # print(f"XXX {threading.get_ident()} Detected stall at search start")
+                        with self.results_queue_lock:
+                            if self.results_queue:
+                                self.stalled = False
+                                self.searching = False
+                                # print(f"XXX {threading.get_ident()} This thread has new results, dropping stall mark")
+
                     # Assuming we haven't been marked completed, wait
                     # until there is no other thread searching.
                     while not self.completed and self.searching:
+                        # print(f"XXX {threading.get_ident()} Waiting to search")
                         self.can_search_cv.wait()
 
                     # If someone set the completed flag, bail.
@@ -534,6 +546,8 @@ else:
                     # is currently in the critical section for
                     # taskmaster work.
                     self.searching = True
+
+                    # print(f"XXX {threading.get_ident()} Thread is searching")
 
                     # Bulk acquire the tasks in the results queue
                     # under the result queue lock, then process them
@@ -567,9 +581,11 @@ else:
                     # threads, awaken them all. We need to awaken them
                     # all because processing even one result might
                     # unblock an arbitrary amount of new work.
-                    if results_queue and self.idlers:
-                        self.idle_epoch += 1
-                        self.idlers_cv.notify_all()
+                    if results_queue and self.stalled:
+                        # self.stalled = False
+                        pass # XXX {threading.get_ident()} what should happen here. Presumably a notify?
+                        #self.idle_epoch += 1
+                        #self.idlers_cv.notify_all()
 
                     # We are done with any task objects that
                     # were in the results queue.
@@ -580,7 +596,7 @@ else:
                     # needs execution. If we run out of tasks, go idle
                     # until results arrive if jobs are pending, or
                     # mark the walk as complete if not.
-                    while self.searching:
+                    while self.searching and not self.stalled:
                         task = self.taskmaster.next_task()
 
                         if task:
@@ -603,6 +619,7 @@ else:
                                     task.executed()
                                     task.postprocess()
                                 else:
+                                    # print(f"XXX {threading.get_ident()} Thread found work to requiring execution")
                                     self.jobs += 1
                                     self.searching = False
                                     self.can_search_cv.notify()
@@ -613,23 +630,15 @@ else:
                             # crank. Note that we are no longer
                             # searching so that we drop out of this
                             # loop without `task` set.
-                            self.searching = False
-
                             if self.jobs:
                                 # No task was found, but there are
                                 # outstanding jobs executing that
                                 # might unblock new tasks when they
-                                # complete. Note that we are becoming
-                                # idle, then wait here without holding
-                                # the lock until the idle epoch has
-                                # been advanced, meaning that new
-                                # results have arrived.
-                                idle_epoch = self.idle_epoch
-                                self.idlers += 1
-                                while self.idle_epoch == idle_epoch:
-                                    self.idlers_cv.wait()
-                                self.idlers -= 1
+                                # complete. We are stalled.
+                                self.stalled = True
+                                # print(f"XXX {threading.get_ident()} Stalled by failed search")
                             else:
+                                self.searching = False
                                 # We didn't find a task and there are
                                 # no jobs outstanding, so there is
                                 # nothing that will ever return
@@ -641,11 +650,11 @@ else:
                                 # condvar. Also advance the idle epoch
                                 # and awake all idle threads so they
                                 # can terminate.
+                                # print(f"XXX {threading.get_ident()} Failed search with no jobs")
                                 if not self.completed:
+                                    # print(f"XXX {threading.get_ident()} Noting completion")
                                     self.completed = True
-                                    self.idle_epoch += 1
                                     self.can_search_cv.notify_all()
-                                    self.idlers_cv.notify_all()
 
                 # We no longer hold `tm_lock` here. If we have a task,
                 # we can now execute it. If there are threads waiting
