@@ -638,10 +638,14 @@ else:
                                 # is complete. If we are the first to
                                 # notice, set the completed flag and
                                 # awaken anyone sleeping on the
-                                # condvar.
+                                # condvar. Also advance the idle epoch
+                                # and awake all idle threads so they
+                                # can terminate.
                                 if not self.completed:
                                     self.completed = True
+                                    self.idle_epoch += 1
                                     self.can_search_cv.notify_all()
+                                    self.idlers_cv.notify_all()
 
                 # We no longer hold `tm_lock` here. If we have a task,
                 # we can now execute it. If there are threads waiting
