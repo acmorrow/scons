@@ -33,6 +33,8 @@ import os
 import signal
 import threading
 
+from enum import Enum
+
 import SCons.Errors
 import SCons.Warnings
 
@@ -436,6 +438,12 @@ else:
 
     class NewParallel:
 
+        class State(Enum):
+            ready = 0
+            searching = 1
+            stalled = 2
+            completed = 3
+
         class Worker(threading.Thread):
             def __init__(self, owner):
                 super().__init__()
@@ -453,24 +461,22 @@ else:
             self.interrupted = InterruptState()
             self.workers = []
 
-            # The `tm_lock` is what ensures that we only have one thread
-            # interacting with the taskmaster at a time. It also protects
-            # access to our state that gets updated concurrently. All condition
-            # variables are associated with this lock.
+            # The `tm_lock` is what ensures that we only have one
+            # thread interacting with the taskmaster at a time. It
+            # also protects access to our state that gets updated
+            # concurrently. The `can_search_cv` is associated with
+            # this mutex.
             self.tm_lock = threading.Lock()
-
-            # The `searching` state and the `can_search_cv` are used
-            # to manage a leader / follower pattern for access to the
-            # taskmaster.
-            self.searching = False
-            self.can_search_cv = threading.Condition(self.tm_lock)
 
             # The following state helps us manage the state machine as
             # we decide whether there is more work to do or whether we
             # need to stall on job completions.
             self.jobs = 0
-            self.completed = False
-            self.stalled = False
+            self.state = NewParallel.State.ready
+
+            # The `can_search_cv` is used to manage a leader /
+            # follower pattern for access to the taskmaster.
+            self.can_search_cv = threading.Condition(self.tm_lock)
 
             # The queue of tasks that have completed execution. The
             # next thread to obtain the tm_lock will retire all of
@@ -524,38 +530,44 @@ else:
 
                     # print(f"XXX {threading.get_ident()} Gained exclusive access")
 
-                    # We will only see `task` set here if we have
-                    # looped back after executing a task. If we are
-                    # back here with a set `task` and find that we are
-                    # stalled, we should speculatively indicate that
-                    # we are no longer stalled, set `searching` to
-                    # False to bypass the condition wait (it will get
-                    # set to True below), and immediately process the
-                    # results queue which will hopefully light up new
-                    # work. Either way, clear `task` here because we
-                    # are now truly done with it.
-                    if self.stalled and task is not None:
-                        # print(f"XXX {threading.get_ident()} Detected stall with completed task, bypassing wait")
-                        self.stalled = False
-                        self.searching = False
+                    # Capture whether we got here with `task` set,
+                    # then drop our reference to the task as we are no
+                    # longer interested in the actual object.
+                    completed_task = (task is not None)
                     task = None
+
+                    # We will only have `completed_task` set here if
+                    # we have looped back after executing a task. If
+                    # we have completed a task and find that we are
+                    # stalled, we should speculatively indicate that
+                    # we are no longer stalled by transitioning to the
+                    # 'ready' state which will bypass the condition
+                    # wait so that we immediately process the results
+                    # queue and hopefully light up new
+                    # work. Otherwise, stay stalled, and we will wait
+                    # in the condvar. Some other thread will come back
+                    # here with a completed task.
+                    if self.state == NewParallel.State.stalled and completed_task:
+                        # print(f"XXX {threading.get_ident()} Detected stall with completed task, bypassing wait")
+                        self.state = NewParallel.State.ready
 
                     # Assuming we haven't been marked completed, wait
                     # until there is no other thread searching.
-                    while not self.completed and self.searching:
+                    while self.state == NewParallel.State.searching or self.state == NewParallel.State.stalled:
                         # print(f"XXX {threading.get_ident()} Search already in progress, waiting")
                         self.can_search_cv.wait()
 
                     # If someone set the completed flag, bail.
-                    if self.completed:
+                    if self.state == NewParallel.State.completed:
                         # print(f"XXX {threading.get_ident()} Completion detected, breaking from main loop")
                         break
 
                     # Set the searching flag to indicate that a thread
                     # is currently in the critical section for
                     # taskmaster work.
+                    #
                     # print(f"XXX {threading.get_ident()} Starting search")
-                    self.searching = True
+                    self.state = NewParallel.State.searching
 
                     # Bulk acquire the tasks in the results queue
                     # under the result queue lock, then process them
@@ -595,7 +607,7 @@ else:
                     # needs execution. If we run out of tasks, go idle
                     # until results arrive if jobs are pending, or
                     # mark the walk as complete if not.
-                    while self.searching and not self.stalled:
+                    while self.state == NewParallel.State.searching:
                         # print(f"XXX {threading.get_ident()} Searching for new tasks")
                         task = self.taskmaster.next_task()
 
@@ -622,7 +634,7 @@ else:
                                 else:
                                     self.jobs += 1
                                     # print(f"XXX {threading.get_ident()} Found task requiring execution")
-                                    self.searching = False
+                                    self.state = NewParallel.State.ready
                                     self.can_search_cv.notify()
 
                         else:
@@ -635,26 +647,26 @@ else:
                                 # No task was found, but there are
                                 # outstanding jobs executing that
                                 # might unblock new tasks when they
-                                # complete. We are stalled.
+                                # complete. We are stalled. We do not
+                                # need a notify, because we know there
+                                # are threads outstanding that will
+                                # re-enter the loop.
+                                #
                                 # print(f"XXX {threading.get_ident()} Found no task requiring execution, but have jobs: marking stalled")
-                                self.stalled = True
+                                self.state = NewParallel.State.stalled
                             else:
-                                # print(f"XXX {threading.get_ident()} Found no task requiring execution, and have no jobs: marking complete")
-                                self.searching = False
                                 # We didn't find a task and there are
                                 # no jobs outstanding, so there is
                                 # nothing that will ever return
                                 # results which might unblock new
                                 # tasks. We can conclude that the walk
-                                # is complete. If we are the first to
-                                # notice, set the completed flag and
-                                # awaken anyone sleeping on the
-                                # condvar. Also advance the idle epoch
-                                # and awake all idle threads so they
-                                # can terminate.
-                                if not self.completed:
-                                    self.completed = True
-                                    self.can_search_cv.notify_all()
+                                # is complete. Set the completed flag
+                                # and awaken anyone sleeping on the
+                                # condvar.
+                                #
+                                # print(f"XXX {threading.get_ident()} Found no task requiring execution, and have no jobs: marking complete")
+                                self.state = NewParallel.State.completed
+                                self.can_search_cv.notify_all()
 
                 # We no longer hold `tm_lock` here. If we have a task,
                 # we can now execute it. If there are threads waiting
@@ -676,6 +688,7 @@ else:
                     # executed task and state. The next thread into
                     # the searching loop will complete the
                     # postprocessing work under the taskmaster lock.
+                    #
                     # print(f"XXX {threading.get_ident()} Enqueueing executed task results")
                     with self.results_queue_lock:
                         self.results_queue.append((task, ok))
