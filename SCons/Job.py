@@ -472,11 +472,6 @@ else:
             self.completed = False
             self.stalled = False
 
-            # self.idle_epoch = 0
-            # self.idlers = 0
-            # self.idlers_cv = threading.Condition(self.tm_lock)
-            
-
             # The queue of tasks that have completed execution. The
             # next thread to obtain the tm_lock will retire all of
             # them.
@@ -525,17 +520,14 @@ else:
                 with self.can_search_cv:
 
                     if self.stalled:
-                        # print(f"XXX {threading.get_ident()} Detected stall at search start")
                         with self.results_queue_lock:
                             if self.results_queue:
                                 self.stalled = False
                                 self.searching = False
-                                # print(f"XXX {threading.get_ident()} This thread has new results, dropping stall mark")
 
                     # Assuming we haven't been marked completed, wait
                     # until there is no other thread searching.
                     while not self.completed and self.searching:
-                        # print(f"XXX {threading.get_ident()} Waiting to search")
                         self.can_search_cv.wait()
 
                     # If someone set the completed flag, bail.
@@ -546,8 +538,6 @@ else:
                     # is currently in the critical section for
                     # taskmaster work.
                     self.searching = True
-
-                    # print(f"XXX {threading.get_ident()} Thread is searching")
 
                     # Bulk acquire the tasks in the results queue
                     # under the result queue lock, then process them
@@ -576,16 +566,6 @@ else:
 
                         rtask.postprocess()
                         self.jobs -= 1
-
-                    # If we had results to process, and there are idle
-                    # threads, awaken them all. We need to awaken them
-                    # all because processing even one result might
-                    # unblock an arbitrary amount of new work.
-                    if results_queue and self.stalled:
-                        # self.stalled = False
-                        pass # XXX {threading.get_ident()} what should happen here. Presumably a notify?
-                        #self.idle_epoch += 1
-                        #self.idlers_cv.notify_all()
 
                     # We are done with any task objects that
                     # were in the results queue.
@@ -619,7 +599,6 @@ else:
                                     task.executed()
                                     task.postprocess()
                                 else:
-                                    # print(f"XXX {threading.get_ident()} Thread found work to requiring execution")
                                     self.jobs += 1
                                     self.searching = False
                                     self.can_search_cv.notify()
@@ -636,7 +615,6 @@ else:
                                 # might unblock new tasks when they
                                 # complete. We are stalled.
                                 self.stalled = True
-                                # print(f"XXX {threading.get_ident()} Stalled by failed search")
                             else:
                                 self.searching = False
                                 # We didn't find a task and there are
@@ -650,9 +628,7 @@ else:
                                 # condvar. Also advance the idle epoch
                                 # and awake all idle threads so they
                                 # can terminate.
-                                # print(f"XXX {threading.get_ident()} Failed search with no jobs")
                                 if not self.completed:
-                                    # print(f"XXX {threading.get_ident()} Noting completion")
                                     self.completed = True
                                     self.can_search_cv.notify_all()
 
