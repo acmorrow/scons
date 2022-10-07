@@ -513,30 +513,48 @@ else:
                 threading.stack_size(prev_size)
 
         def _work(self):
+
+            task = None
+
             while True:
 
                 # Obtain the `tm_lock` mutex that gives us exclusive
                 # access to the taskmaster.
                 with self.can_search_cv:
 
-                    if self.stalled:
-                        with self.results_queue_lock:
-                            if self.results_queue:
-                                self.stalled = False
-                                self.searching = False
+                    # print(f"XXX {threading.get_ident()} Gained exclusive access")
+
+                    # We will only see `task` set here if we have
+                    # looped back after executing a task. If we are
+                    # back here with a set `task` and find that we are
+                    # stalled, we should speculatively indicate that
+                    # we are no longer stalled, set `searching` to
+                    # False to bypass the condition wait (it will get
+                    # set to True below), and immediately process the
+                    # results queue which will hopefully light up new
+                    # work. Either way, clear `task` here because we
+                    # are now truly done with it.
+                    if self.stalled and task is not None:
+                        # print(f"XXX {threading.get_ident()} Detected stall with completed task, bypassing wait")
+                        self.stalled = False
+                        self.searching = False
+                    task = None
 
                     # Assuming we haven't been marked completed, wait
                     # until there is no other thread searching.
                     while not self.completed and self.searching:
+                        # print(f"XXX {threading.get_ident()} Search already in progress, waiting")
                         self.can_search_cv.wait()
 
                     # If someone set the completed flag, bail.
                     if self.completed:
+                        # print(f"XXX {threading.get_ident()} Completion detected, breaking from main loop")
                         break
 
                     # Set the searching flag to indicate that a thread
                     # is currently in the critical section for
                     # taskmaster work.
+                    # print(f"XXX {threading.get_ident()} Starting search")
                     self.searching = True
 
                     # Bulk acquire the tasks in the results queue
@@ -549,6 +567,7 @@ else:
                     with self.results_queue_lock:
                         results_queue, self.results_queue = self.results_queue, results_queue
 
+                    # print(f"XXX {threading.get_ident()} Found {len(results_queue)} completed tasks to process")
                     for (rtask, rresult) in results_queue:
                         if rresult:
                             rtask.executed()
@@ -577,6 +596,7 @@ else:
                     # until results arrive if jobs are pending, or
                     # mark the walk as complete if not.
                     while self.searching and not self.stalled:
+                        # print(f"XXX {threading.get_ident()} Searching for new tasks")
                         task = self.taskmaster.next_task()
 
                         if task:
@@ -596,10 +616,12 @@ else:
                                 task.postprocess()
                             else:
                                 if not task.needs_execute():
+                                    # print(f"XXX {threading.get_ident()} Found internal task")
                                     task.executed()
                                     task.postprocess()
                                 else:
                                     self.jobs += 1
+                                    # print(f"XXX {threading.get_ident()} Found task requiring execution")
                                     self.searching = False
                                     self.can_search_cv.notify()
 
@@ -614,8 +636,10 @@ else:
                                 # outstanding jobs executing that
                                 # might unblock new tasks when they
                                 # complete. We are stalled.
+                                # print(f"XXX {threading.get_ident()} Found no task requiring execution, but have jobs: marking stalled")
                                 self.stalled = True
                             else:
+                                # print(f"XXX {threading.get_ident()} Found no task requiring execution, and have no jobs: marking complete")
                                 self.searching = False
                                 # We didn't find a task and there are
                                 # no jobs outstanding, so there is
@@ -637,6 +661,7 @@ else:
                 # to search, one of them can now begin turning the
                 # taskmaster crank in parallel.
                 if task:
+                    # print(f"XXX {threading.get_ident()} Executing task")
                     ok = True
                     try:
                         if self.interrupted():
@@ -647,15 +672,22 @@ else:
                         ok = False
                         task.exception_set()
 
-                    # Grab the results lock and enqueue the executed task
-                    # and state. The next thread into the searching loop
-                    # will complete the postprocessing work under the
-                    # taskmaster lock.
+                    # Grab the results queue lock and enqueue the
+                    # executed task and state. The next thread into
+                    # the searching loop will complete the
+                    # postprocessing work under the taskmaster lock.
+                    # print(f"XXX {threading.get_ident()} Enqueueing executed task results")
                     with self.results_queue_lock:
                         self.results_queue.append((task, ok))
 
-                    # We have no further interest in `task`.
-                    task = None
+                # Tricky state "fallthrough" here. We are going back
+                # to the top of the loop, and `task` will still be
+                # set, indicating that this thread completed a task
+                # execution and delivered new results. That is
+                # important state that we use to understand stall
+                # handling without needing to re-acquire
+                # `results_queue_lock`. Be sure not to perturb the
+                # state of the `task` variable.
 
     Parallel = NewParallel
 
