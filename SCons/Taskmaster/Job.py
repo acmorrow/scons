@@ -238,16 +238,7 @@ class Serial:
             task.postprocess()
         self.taskmaster.cleanup()
 
-
-# Trap import failure so that everything in the Job module but the
-# Parallel class (and its dependent classes) will work if the interpreter
-# doesn't support threads.
-try:
-    import queue
-    import threading
-except ImportError:
-    pass
-else:
+if True:
     class Worker(threading.Thread):
         """A worker thread waits on a task to be posted to its request queue,
         dequeues the task, executes it, and posts a tuple including the task
